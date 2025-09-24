@@ -9,16 +9,19 @@ pub enum Version {
     V4,
 }
 
-pub enum Event<'a> {
+#[derive(Debug)]
+pub enum Event {
     Frame(usize),
-    Str(&'a str),
+    ShortBinUnicode(u8),
     Bool(bool),
     Stop,
     Memoize,
     EmptyList,
     Mark,
     BinInt1(u8),
+    BinInt2(u16),
     BinInt(i32),
+    BinFloat(f64),
     Appends,
 }
 
@@ -48,10 +51,22 @@ impl<R: Read> Reader<R> {
         Ok(byte[0])
     }
 
+    fn read_u16(&mut self) -> Result<u16, Error> {
+        let mut bytes = [0; 2];
+        self.reader.read(&mut bytes)?;
+        Ok(u16::from_le_bytes(bytes))
+    }
+
     fn read_u64(&mut self) -> Result<u64, Error> {
         let mut bytes = [0; 8];
         self.reader.read_exact(&mut bytes)?;
         Ok(u64::from_le_bytes(bytes))
+    }
+
+    fn read_f64(&mut self) -> Result<f64, Error> {
+        let mut bytes = [0; 8];
+        self.reader.read_exact(&mut bytes)?;
+        Ok(f64::from_be_bytes(bytes))
     }
 
     fn read_i32(&mut self) -> Result<i32, Error> {
@@ -67,12 +82,12 @@ impl<R: Read> Reader<R> {
         Ok(())
     }
 
-    fn read_str<'a>(&mut self, len: usize, buf: &'a mut Vec<u8>) -> Result<&'a str, Error> {
-        self.fill_buf(len, buf)?;
-        from_utf8(&buf[buf.len() - len..]).map_err(Error::Str)
-    }
+    // fn read_str<'a>(&mut self, len: usize, buf: &'a mut Vec<u8>) -> Result<&'a str, Error> {
+    //     self.fill_buf(len, buf)?;
+    //     from_utf8(&buf[buf.len() - len..]).map_err(Error::Str)
+    // }
 
-    pub fn read_event<'a>(&mut self, buf: &'a mut Vec<u8>) -> Result<Event<'a>, Error> {
+    pub fn read_event<'a>(&mut self, buf: &mut Vec<u8>) -> Result<Event, Error> {
         let opcode = self.read_u8()?;
 
         // see https://github.com/Legoclones/pickledoc/blob/main/Opcodes.md
@@ -81,8 +96,8 @@ impl<R: Read> Reader<R> {
             0x8c => {
                 // short binunicode
                 let len = self.read_u8()?;
-                let s = self.read_str(len as usize, buf)?;
-                Ok(Event::Str(s))
+                self.fill_buf(len as usize, buf)?;
+                Ok(Event::ShortBinUnicode(len))
             }
             0x94 => Ok(Event::Memoize),
             0x65 => Ok(Event::Appends),
@@ -91,6 +106,8 @@ impl<R: Read> Reader<R> {
             0x28 => Ok(Event::Mark),      // (
             0x4a => Ok(Event::BinInt(self.read_i32()?)),
             0x4b => Ok(Event::BinInt1(self.read_u8()?)), // K
+            0x4d => Ok(Event::BinInt2(self.read_u16()?)), // M
+            0x47 => Ok(Event::BinFloat(self.read_f64()?)), // G
             0x88 => Ok(Event::Bool(true)),
             _ => Err(Error::OpCode(opcode)),
         }
@@ -100,6 +117,11 @@ impl<R: Read> Reader<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn size_of_event() {
+        assert_eq!(std::mem::size_of::<Event>(), 16);
+    }
 
     #[test]
     fn test_read_true() -> Result<(), Error> {
@@ -135,6 +157,23 @@ mod tests {
     }
 
     #[test]
+    fn test_read_float() -> Result<(), Error> {
+        let data: &[u8] = b"\x80\x04\x95\n\x00\x00\x00\x00\x00\x00\x00G?\xe1G\xae\x14z\xe1H.";
+        let mut reader = Reader::new(data)?;
+        let mut buf = Vec::new();
+        loop {
+            match reader.read_event(&mut buf)? {
+                Event::BinFloat(v) => assert_eq!(v, 0.54),
+                Event::Stop => break,
+                _ => (),
+            }
+            buf.clear();
+        }
+
+        Ok(())
+    }
+
+    #[test]
     fn test_read_str() -> Result<(), Error> {
         // "/"
         let data: &[u8] = &[
@@ -143,15 +182,19 @@ mod tests {
         ];
         let mut reader = Reader::new(data)?;
         let mut buf = Vec::new();
+        let mut s = Vec::new();
         loop {
             match reader.read_event(&mut buf)? {
-                Event::Str(s) => assert_eq!(s, "/"),
+                Event::ShortBinUnicode(len) => {
+                    s = buf[buf.len() - len as usize..].to_vec();
+                }
                 Event::Stop => break,
                 _ => (),
             }
             buf.clear();
         }
 
+        assert_eq!(s, b"/");
         Ok(())
     }
 

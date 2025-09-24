@@ -17,8 +17,8 @@ impl std::fmt::Debug for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::Io(error) => error.fmt(f),
-            Error::Protocol(p) => write!(f, "Unsupported protocol: {p:x?}"),
-            Error::OpCode(op) => write!(f, "Unsupported opcode: {op:x}"),
+            Error::Protocol(p) => write!(f, "Unsupported protocol: 0x{p:x?}"),
+            Error::OpCode(op) => write!(f, "Unsupported opcode: 0x{op:x}"),
             Error::Str(error) => error.fmt(f),
         }
     }
