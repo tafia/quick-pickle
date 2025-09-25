@@ -1,19 +1,24 @@
 //! A module to read pickle events
 
-use std::{io::BufRead, str::from_utf8};
+use std::{
+    fs::File,
+    io::{BufRead, BufReader, Cursor},
+    path::Path,
+    str::from_utf8,
+    sync::mpsc::channel,
+    thread::{self},
+};
 
 use crate::errors::Error;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Version {
-    V4,
-}
+const FRAME_SPAWN_SIZE: u64 = 1024 * 128;
+// const FRAME_SPAWN_SIZE: u64 = 1 << 32;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Event {
     // Protocol identification
     Proto(u8),
-    Frame(usize),
+    Frame(u64),
 
     // Stack manipulation
     Mark,
@@ -38,7 +43,7 @@ pub enum Event {
     ShortBinString { len: u8 },
     Unicode { len: usize },
     BinUnicode { len: i32 },
-    ShortBinUnicode(u8),
+    ShortBinUnicode { len: u8 },
     BinUnicode8 { len: i64 },
     BinBytes { len: i32 },
     ShortBinBytes { len: u8 },
@@ -98,46 +103,79 @@ pub enum Event {
 
 pub struct Reader<R> {
     reader: R,
+    pos: usize,
+}
+
+impl Reader<BufReader<File>> {
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, Error> {
+        let file = File::open(path)?;
+        Ok(Reader::new(BufReader::new(file)))
+    }
 }
 
 impl<R: BufRead> Reader<R> {
     pub fn new(reader: R) -> Self {
-        Reader { reader }
+        Reader { reader, pos: 0 }
+    }
+
+    /// Load len bytes and create a new frame reader
+    fn frame_reader(&mut self, len: u64) -> Result<Reader<Cursor<Vec<u8>>>, Error> {
+        let start = self.pos;
+        let mut frame_buf = Vec::new();
+        self.fill_buf(len as usize, &mut frame_buf)?;
+        Ok(Reader::new_at(Cursor::new(frame_buf), start))
+    }
+
+    fn new_at(reader: R, start: usize) -> Reader<R> {
+        Reader { reader, pos: start }
     }
 
     fn read_u8(&mut self) -> Result<u8, Error> {
         let mut byte = [0];
-        self.reader.read(&mut byte)?;
+        self.reader.read_exact(&mut byte)?;
+        self.pos += 1;
         Ok(byte[0])
     }
 
     fn read_u16(&mut self) -> Result<u16, Error> {
         let mut bytes = [0; 2];
-        self.reader.read(&mut bytes)?;
+        self.reader.read_exact(&mut bytes)?;
+        self.pos += 2;
         Ok(u16::from_le_bytes(bytes))
+    }
+
+    fn read_u32(&mut self) -> Result<u32, Error> {
+        let mut bytes = [0; 4];
+        self.reader.read_exact(&mut bytes)?;
+        self.pos += 4;
+        Ok(u32::from_le_bytes(bytes))
     }
 
     fn read_i64(&mut self) -> Result<i64, Error> {
         let mut bytes = [0; 8];
         self.reader.read_exact(&mut bytes)?;
+        self.pos += 8;
         Ok(i64::from_le_bytes(bytes))
     }
 
     fn read_u64(&mut self) -> Result<u64, Error> {
         let mut bytes = [0; 8];
         self.reader.read_exact(&mut bytes)?;
+        self.pos += 8;
         Ok(u64::from_le_bytes(bytes))
     }
 
     fn read_f64(&mut self) -> Result<f64, Error> {
         let mut bytes = [0; 8];
         self.reader.read_exact(&mut bytes)?;
+        self.pos += 8;
         Ok(f64::from_be_bytes(bytes))
     }
 
     fn read_i32(&mut self) -> Result<i32, Error> {
         let mut bytes = [0; 4];
         self.reader.read_exact(&mut bytes)?;
+        self.pos += 4;
         Ok(i32::from_le_bytes(bytes))
     }
 
@@ -145,25 +183,25 @@ impl<R: BufRead> Reader<R> {
         let buf_len = buf.len();
         buf.resize(buf_len + len, 0);
         self.reader.read_exact(&mut buf[buf_len..])?;
+        self.pos += len;
         Ok(())
     }
 
     fn fill_line(&mut self, buf: &mut Vec<u8>) -> Result<usize, Error> {
-        Ok(self.reader.read_until(b'\n', buf)?)
-
-        // let mut line = Vec::new();
-        // loop {
-        //     let byte = self.read_u8()?;
-        //     if byte == b'\n' {
-        //         break;
-        //     }
-        //     line.push(byte);
-        // }
-        // from_utf8(&line).map(|s| s.to_string()).map_err(Error::Str)
+        let len = self.reader.read_until(b'\n', buf)?;
+        self.pos += len;
+        Ok(len)
     }
 
     pub fn read_event<'a>(&mut self, buf: &mut Vec<u8>) -> Result<Event, Error> {
-        let opcode = self.read_u8()?;
+        let opcode = match self.read_u8() {
+            Ok(opcode) => opcode,
+            Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                // fake a stop event
+                return Ok(Event::Stop);
+            }
+            Err(e) => return Err(e),
+        };
 
         match opcode {
             // Protocol identification
@@ -269,9 +307,9 @@ impl<R: BufRead> Reader<R> {
             }
             0x8c => {
                 // SHORT_BINUNICODE
-                let len = self.read_u8()? as usize;
-                self.fill_buf(len, buf)?;
-                Ok(Event::ShortBinUnicode(len as u8))
+                let len = self.read_u8()?;
+                self.fill_buf(len as usize, buf)?;
+                Ok(Event::ShortBinUnicode { len })
             }
             0x8d => {
                 // BINUNICODE8
@@ -378,10 +416,10 @@ impl<R: BufRead> Reader<R> {
             // Extensions
             0x82 => Ok(Event::Ext1(self.read_u8()?)), // EXT1
             0x83 => Ok(Event::Ext2(self.read_u16()?)), // EXT2
-            0x84 => Ok(Event::Ext4(self.read_i32()? as u32)), // EXT4
+            0x84 => Ok(Event::Ext4(self.read_u32()?)), // EXT4
 
             // Protocol 4
-            0x95 => Ok(Event::Frame(self.read_u64()? as usize)), // FRAME
+            0x95 => Ok(Event::Frame(self.read_u64()?)), // FRAME
 
             // Protocol 5
             0x97 => Ok(Event::NextBuffer),     // NEXT_BUFFER
@@ -389,6 +427,60 @@ impl<R: BufRead> Reader<R> {
 
             _ => Err(Error::OpCode(opcode)),
         }
+    }
+
+    /// Collect all events in parallel
+    pub fn par_collect_events(&mut self) -> Result<Vec<Event>, Error> {
+        let (tx, rx) = channel();
+        let mut events = Vec::new();
+        let mut buf = Vec::new();
+        let mut threads = Vec::new();
+        loop {
+            match self.read_event(&mut buf)? {
+                Event::Frame(len) => {
+                    // if the frame is big enough, spawn a new reader to send in parallel
+                    if len >= FRAME_SPAWN_SIZE {
+                        // load the frame and spawn a new reader
+                        // dbg!(len);
+                        let mut frame_reader = self.frame_reader(len)?;
+                        let tx = tx.clone();
+                        threads.push(thread::spawn::<_, Result<(), Error>>(move || {
+                            let mut frame_buf = Vec::new();
+                            loop {
+                                let event = frame_reader.read_event(&mut frame_buf)?;
+                                if let Event::Stop = event {
+                                    break;
+                                }
+                                frame_buf.clear();
+                                tx.send((frame_reader.pos, event)).unwrap();
+                            }
+                            Ok(())
+                        }));
+                    }
+                }
+                Event::Stop => break,
+                event => events.push((self.pos, event)),
+            }
+            buf.clear();
+        }
+
+        if !threads.is_empty() {
+            // assert_eq!(threads.len(), 4);
+            drop(tx); // drop orphaned tx
+
+            // wait for the threads to end
+            for th in threads {
+                th.join().unwrap()?;
+            }
+
+            // collect all events
+            while let Ok((id, event)) = rx.recv() {
+                events.push((id, event));
+            }
+            events.sort_by_key(|(id, _)| *id); // stable sort by frame
+        }
+
+        Ok(events.into_iter().map(|(_, event)| event).collect())
     }
 }
 
@@ -465,7 +557,7 @@ mod tests {
         let mut s = Vec::new();
         loop {
             match reader.read_event(&mut buf)? {
-                Event::ShortBinUnicode(len) => {
+                Event::ShortBinUnicode { len } => {
                     s = buf[buf.len() - len as usize..].to_vec();
                 }
                 Event::Stop => break,
@@ -494,6 +586,47 @@ mod tests {
         }
         assert_eq!(list, (0..10).collect::<Vec<_>>());
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_collect_str() -> Result<(), Error> {
+        // "/"
+        #[rustfmt::skip]
+        let data: &[u8] = &[
+            0x80, 0x04, // proto
+            0x95, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // frame
+            0x8c, 0x01, b'/', // str
+            0x94, // memo
+            b'.', // stop
+        ];
+        let mut reader = Reader::new(data);
+        let events = reader.par_collect_events()?;
+        assert_eq!(
+            &events,
+            &[
+                Event::Proto(4),
+                Event::ShortBinUnicode { len: 1 },
+                Event::Memoize
+            ],
+            "{events:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_ints_from_file() -> Result<(), Error> {
+        let mut reader = Reader::open(concat!(env!("CARGO_MANIFEST_DIR"), "/ints.pickle"))?;
+        let events = reader.par_collect_events()?;
+        assert_eq!(events.len(), 10023);
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_dict_from_file() -> Result<(), Error> {
+        let mut reader = Reader::open(concat!(env!("CARGO_MANIFEST_DIR"), "/dict.pickle"))?;
+        let events = reader.par_collect_events()?;
+        assert_eq!(events.len(), 20057);
         Ok(())
     }
 }
