@@ -1,6 +1,6 @@
 //! A module to read pickle events
 
-use std::{io::Read, str::from_utf8};
+use std::{io::BufRead, str::from_utf8};
 
 use crate::errors::Error;
 
@@ -9,7 +9,7 @@ pub enum Version {
     V4,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum Event {
     // Protocol identification
     Proto(u8),
@@ -29,23 +29,21 @@ pub enum Event {
     BinInt(i32),
     BinInt1(u8),
     BinInt2(u16),
-    Long1(Vec<u8>),
-    Long4(Vec<u8>),
+    Long(i64),
     Float(f64),
-    BinFloat(f64),
 
     // Strings and bytes
-    String(String),
-    BinString(Vec<u8>),
-    ShortBinString(u8),
-    Unicode(String),
-    BinUnicode(Vec<u8>),
+    String { len: usize },
+    BinString { len: i32 },
+    ShortBinString { len: u8 },
+    Unicode { len: usize },
+    BinUnicode { len: i32 },
     ShortBinUnicode(u8),
-    BinUnicode8(Vec<u8>),
-    BinBytes(Vec<u8>),
-    ShortBinBytes(u8),
-    BinBytes8(Vec<u8>),
-    ByteArray8(Vec<u8>),
+    BinUnicode8 { len: i64 },
+    BinBytes { len: i32 },
+    ShortBinBytes { len: u8 },
+    BinBytes8 { len: u64 },  // immutable
+    ByteArray8 { len: u64 }, // mutable
 
     // Collections
     EmptyTuple,
@@ -75,17 +73,17 @@ pub enum Event {
     Memoize,
 
     // Object construction
-    Global(String, String),
+    Global { module_len: u32, name_len: u32 },
     StackGlobal,
     Reduce,
     Build,
-    Inst(String, String),
+    Inst { module_len: u32, name_len: u32 },
     Obj,
     NewObj,
     NewObjEx,
 
     // Persistent objects
-    PersId(String),
+    PersId { id_len: usize },
     BinPersId,
 
     // Extensions
@@ -100,22 +98,11 @@ pub enum Event {
 
 pub struct Reader<R> {
     reader: R,
-    #[allow(dead_code)]
-    version: Version,
 }
 
-impl<R: Read> Reader<R> {
-    pub fn new(mut reader: R) -> Result<Self, Error> {
-        let mut header = [0u8; 2];
-        reader.read_exact(&mut header)?;
-        if header == [0x80, 0x04] {
-            Ok(Reader {
-                reader,
-                version: Version::V4,
-            })
-        } else {
-            Err(Error::Protocol(header))
-        }
+impl<R: BufRead> Reader<R> {
+    pub fn new(reader: R) -> Self {
+        Reader { reader }
     }
 
     fn read_u8(&mut self) -> Result<u8, Error> {
@@ -128,6 +115,12 @@ impl<R: Read> Reader<R> {
         let mut bytes = [0; 2];
         self.reader.read(&mut bytes)?;
         Ok(u16::from_le_bytes(bytes))
+    }
+
+    fn read_i64(&mut self) -> Result<i64, Error> {
+        let mut bytes = [0; 8];
+        self.reader.read_exact(&mut bytes)?;
+        Ok(i64::from_le_bytes(bytes))
     }
 
     fn read_u64(&mut self) -> Result<u64, Error> {
@@ -155,18 +148,18 @@ impl<R: Read> Reader<R> {
         Ok(())
     }
 
+    fn fill_line(&mut self, buf: &mut Vec<u8>) -> Result<usize, Error> {
+        Ok(self.reader.read_until(b'\n', buf)?)
 
-
-    fn read_line_string(&mut self, _buf: &mut Vec<u8>) -> Result<String, Error> {
-        let mut line = Vec::new();
-        loop {
-            let byte = self.read_u8()?;
-            if byte == b'\n' {
-                break;
-            }
-            line.push(byte);
-        }
-        from_utf8(&line).map(|s| s.to_string()).map_err(Error::Str)
+        // let mut line = Vec::new();
+        // loop {
+        //     let byte = self.read_u8()?;
+        //     if byte == b'\n' {
+        //         break;
+        //     }
+        //     line.push(byte);
+        // }
+        // from_utf8(&line).map(|s| s.to_string()).map_err(Error::Str)
     }
 
     pub fn read_event<'a>(&mut self, buf: &mut Vec<u8>) -> Result<Event, Error> {
@@ -177,88 +170,102 @@ impl<R: Read> Reader<R> {
             0x80 => Ok(Event::Proto(self.read_u8()?)),
 
             // Stack manipulation
-            0x28 => Ok(Event::Mark),       // (
-            0x2e => Ok(Event::Stop),       // .
-            0x30 => Ok(Event::Pop),        // 0
-            0x31 => Ok(Event::PopMark),    // 1
-            0x32 => Ok(Event::Dup),        // 2
+            0x28 => Ok(Event::Mark),    // (
+            0x2e => Ok(Event::Stop),    // .
+            0x30 => Ok(Event::Pop),     // 0
+            0x31 => Ok(Event::PopMark), // 1
+            0x32 => Ok(Event::Dup),     // 2
 
             // Basic types
-            0x4e => Ok(Event::None),       // N
-            0x88 => Ok(Event::Bool(true)), // NEWTRUE
+            0x4e => Ok(Event::None),        // N
+            0x88 => Ok(Event::Bool(true)),  // NEWTRUE
             0x89 => Ok(Event::Bool(false)), // NEWFALSE
             0x49 => {
                 // INT - decimal string
-                let s = self.read_line_string(buf)?;
-                if s == "01" {
-                    Ok(Event::Bool(true))
-                } else if s == "00" {
-                    Ok(Event::Bool(false))
+                let start = buf.len();
+                let _ = self.fill_line(buf)?;
+                let s = &buf[start..];
+                let event = if s == b"01" {
+                    Event::Bool(true)
+                } else if s == b"00" {
+                    Event::Bool(false)
                 } else {
-                    Ok(Event::Int(s.parse().map_err(|_| Error::Protocol([0x49, 0]))?))
-                }
+                    Event::Int(atoi::atoi::<i32>(s).ok_or(Error::Protocol(0x49))?)
+                };
+                buf.truncate(start);
+                Ok(event)
             }
-            0x4a => Ok(Event::BinInt(self.read_i32()?)),     // J
-            0x4b => Ok(Event::BinInt1(self.read_u8()?)),     // K
-            0x4d => Ok(Event::BinInt2(self.read_u16()?)),    // M
+            0x4a => Ok(Event::BinInt(self.read_i32()?)), // J
+            0x4b => Ok(Event::BinInt1(self.read_u8()?)), // K
+            0x4d => Ok(Event::BinInt2(self.read_u16()?)), // M
             0x4c => {
                 // LONG - decimal string
-                let s = self.read_line_string(buf)?;
-                let s = if s.ends_with('L') { &s[..s.len()-1] } else { &s };
-                // For simplicity, store as string bytes
-                Ok(Event::Long1(s.bytes().collect()))
+                let start = buf.len();
+                let _ = self.fill_line(buf)?;
+                if buf.last() == Some(&b'L') {
+                    buf.pop();
+                }
+                let long = atoi::atoi(&buf[start..]).ok_or(Error::Protocol(0x4c))?;
+                buf.truncate(start);
+                Ok(Event::Long(long))
             }
             0x8a => {
                 // LONG1
+                let start = buf.len();
                 let len = self.read_u8()? as usize;
-                self.fill_buf(len, buf)?;
-                let start = buf.len() - len;
-                Ok(Event::Long1(buf[start..].to_vec()))
+                let _ = self.fill_buf(len, buf)?;
+                let long = atoi::atoi(&buf[start..]).ok_or(Error::Protocol(0x8a))?;
+                buf.truncate(start);
+                Ok(Event::Long(long))
             }
             0x8b => {
                 // LONG4
+                let start = buf.len();
                 let len = self.read_i32()? as usize;
-                self.fill_buf(len, buf)?;
-                let start = buf.len() - len;
-                Ok(Event::Long4(buf[start..].to_vec()))
+                let _ = self.fill_buf(len, buf)?;
+                let long = atoi::atoi(&buf[start..]).ok_or(Error::Protocol(0x8a))?;
+                buf.truncate(start);
+                Ok(Event::Long(long))
             }
             0x46 => {
                 // FLOAT - decimal string
-                let s = self.read_line_string(buf)?;
-                Ok(Event::Float(s.parse().map_err(|_| Error::Protocol([0x46, 0]))?))
+                let start = buf.len();
+                let _ = self.fill_line(buf)?;
+                let s = from_utf8(&buf[start..]).map_err(Error::Str)?;
+                let v = s.parse().map_err(|_| Error::Protocol(0x46))?;
+                buf.truncate(start);
+                Ok(Event::Float(v))
             }
-            0x47 => Ok(Event::BinFloat(self.read_f64()?)),   // G
+            0x47 => Ok(Event::Float(self.read_f64()?)), // G
 
             // Strings and bytes
             0x53 => {
                 // STRING
-                let s = self.read_line_string(buf)?;
-                Ok(Event::String(s))
+                let len = self.fill_line(buf)?;
+                Ok(Event::String { len })
             }
             0x54 => {
                 // BINSTRING
-                let len = self.read_i32()? as usize;
-                self.fill_buf(len, buf)?;
-                let start = buf.len() - len;
-                Ok(Event::BinString(buf[start..].to_vec()))
+                let len = self.read_i32()?;
+                self.fill_buf(len as usize, buf)?;
+                Ok(Event::BinString { len })
             }
             0x55 => {
                 // SHORT_BINSTRING
-                let len = self.read_u8()? as usize;
-                self.fill_buf(len, buf)?;
-                Ok(Event::ShortBinString(len as u8))
+                let len = self.read_u8()?;
+                self.fill_buf(len as usize, buf)?;
+                Ok(Event::ShortBinString { len })
             }
             0x56 => {
                 // UNICODE
-                let s = self.read_line_string(buf)?;
-                Ok(Event::Unicode(s))
+                let len = self.fill_line(buf)?;
+                Ok(Event::Unicode { len })
             }
             0x58 => {
                 // BINUNICODE
-                let len = self.read_i32()? as usize;
-                self.fill_buf(len, buf)?;
-                let start = buf.len() - len;
-                Ok(Event::BinUnicode(buf[start..].to_vec()))
+                let len = self.read_i32()?;
+                self.fill_buf(len as usize, buf)?;
+                Ok(Event::BinUnicode { len })
             }
             0x8c => {
                 // SHORT_BINUNICODE
@@ -268,105 +275,109 @@ impl<R: Read> Reader<R> {
             }
             0x8d => {
                 // BINUNICODE8
-                let len = self.read_u64()? as usize;
-                self.fill_buf(len, buf)?;
-                let start = buf.len() - len;
-                Ok(Event::BinUnicode8(buf[start..].to_vec()))
+                let len = self.read_i64()?;
+                self.fill_buf(len as usize, buf)?;
+                Ok(Event::BinUnicode8 { len })
             }
             0x42 => {
                 // BINBYTES
-                let len = self.read_i32()? as usize;
-                self.fill_buf(len, buf)?;
-                let start = buf.len() - len;
-                Ok(Event::BinBytes(buf[start..].to_vec()))
+                let len = self.read_i32()?;
+                self.fill_buf(len as usize, buf)?;
+                Ok(Event::BinBytes { len })
             }
             0x43 => {
                 // SHORT_BINBYTES
-                let len = self.read_u8()? as usize;
-                self.fill_buf(len, buf)?;
-                Ok(Event::ShortBinBytes(len as u8))
+                let len = self.read_u8()?;
+                self.fill_buf(len as usize, buf)?;
+                Ok(Event::ShortBinBytes { len })
             }
             0x8e => {
                 // BINBYTES8
-                let len = self.read_u64()? as usize;
-                self.fill_buf(len, buf)?;
-                let start = buf.len() - len;
-                Ok(Event::BinBytes8(buf[start..].to_vec()))
+                let len = self.read_u64()?;
+                self.fill_buf(len as usize, buf)?;
+                Ok(Event::BinBytes8 { len })
             }
             0x96 => {
                 // BYTEARRAY8
-                let len = self.read_u64()? as usize;
-                self.fill_buf(len, buf)?;
-                let start = buf.len() - len;
-                Ok(Event::ByteArray8(buf[start..].to_vec()))
+                let len = self.read_u64()?;
+                self.fill_buf(len as usize, buf)?;
+                Ok(Event::ByteArray8 { len })
             }
 
             // Collections
-            0x29 => Ok(Event::EmptyTuple),  // )
-            0x74 => Ok(Event::Tuple),       // t
-            0x85 => Ok(Event::Tuple1),      // TUPLE1
-            0x86 => Ok(Event::Tuple2),      // TUPLE2
-            0x87 => Ok(Event::Tuple3),      // TUPLE3
-            0x5d => Ok(Event::EmptyList),   // ]
-            0x6c => Ok(Event::List),        // l
-            0x61 => Ok(Event::Append),      // a
-            0x65 => Ok(Event::Appends),     // e
-            0x7d => Ok(Event::EmptyDict),   // }
-            0x64 => Ok(Event::Dict),        // d
-            0x73 => Ok(Event::SetItem),     // s
-            0x75 => Ok(Event::SetItems),    // u
-            0x8f => Ok(Event::EmptySet),    // EMPTY_SET
-            0x90 => Ok(Event::AdditItems),  // ADDITEMS
-            0x91 => Ok(Event::FrozenSet),   // FROZENSET
+            0x29 => Ok(Event::EmptyTuple), // )
+            0x74 => Ok(Event::Tuple),      // t
+            0x85 => Ok(Event::Tuple1),     // TUPLE1
+            0x86 => Ok(Event::Tuple2),     // TUPLE2
+            0x87 => Ok(Event::Tuple3),     // TUPLE3
+            0x5d => Ok(Event::EmptyList),  // ]
+            0x6c => Ok(Event::List),       // l
+            0x61 => Ok(Event::Append),     // a
+            0x65 => Ok(Event::Appends),    // e
+            0x7d => Ok(Event::EmptyDict),  // }
+            0x64 => Ok(Event::Dict),       // d
+            0x73 => Ok(Event::SetItem),    // s
+            0x75 => Ok(Event::SetItems),   // u
+            0x8f => Ok(Event::EmptySet),   // EMPTY_SET
+            0x90 => Ok(Event::AdditItems), // ADDITEMS
+            0x91 => Ok(Event::FrozenSet),  // FROZENSET
 
             // Memo operations
             0x67 => {
                 // GET
-                let s = self.read_line_string(buf)?;
-                Ok(Event::Get(s.parse().map_err(|_| Error::Protocol([0x67, 0]))?))
+                let start = buf.len();
+                let _ = self.fill_line(buf)?;
+                let id = atoi::atoi::<i32>(&buf[start..]).ok_or(Error::Protocol(0x67))?;
+                buf.truncate(start);
+                Ok(Event::Get(id))
             }
-            0x68 => Ok(Event::BinGet(self.read_u8()?)),       // h
+            0x68 => Ok(Event::BinGet(self.read_u8()?)), // h
             0x6a => Ok(Event::LongBinGet(self.read_i32()? as u32)), // j
             0x70 => {
                 // PUT
-                let s = self.read_line_string(buf)?;
-                Ok(Event::Put(s.parse().map_err(|_| Error::Protocol([0x70, 0]))?))
+                let start = buf.len();
+                let _ = self.fill_line(buf)?;
+                let id = atoi::atoi::<i32>(&buf[start..]).ok_or(Error::Protocol(0x70))?;
+                buf.truncate(start);
+                Ok(Event::Put(id))
             }
-            0x71 => Ok(Event::BinPut(self.read_u8()?)),       // q
+            0x71 => Ok(Event::BinPut(self.read_u8()?)), // q
             0x72 => Ok(Event::LongBinPut(self.read_i32()? as u32)), // r
-            0x94 => Ok(Event::Memoize),                       // MEMOIZE
+            0x94 => Ok(Event::Memoize),                 // MEMOIZE
 
             // Object construction
             0x63 => {
                 // GLOBAL
-                let module = self.read_line_string(buf)?;
-                let name = self.read_line_string(buf)?;
-                Ok(Event::Global(module, name))
+                Ok(Event::Global {
+                    module_len: self.fill_line(buf)? as u32,
+                    name_len: self.fill_line(buf)? as u32,
+                })
             }
             0x93 => Ok(Event::StackGlobal), // STACK_GLOBAL
             0x52 => Ok(Event::Reduce),      // R
             0x62 => Ok(Event::Build),       // b
             0x69 => {
                 // INST
-                let module = self.read_line_string(buf)?;
-                let name = self.read_line_string(buf)?;
-                Ok(Event::Inst(module, name))
+                Ok(Event::Inst {
+                    module_len: self.fill_line(buf)? as u32,
+                    name_len: self.fill_line(buf)? as u32,
+                })
             }
-            0x6f => Ok(Event::Obj),         // o
-            0x81 => Ok(Event::NewObj),      // NEWOBJ
-            0x92 => Ok(Event::NewObjEx),    // NEWOBJ_EX
+            0x6f => Ok(Event::Obj),      // o
+            0x81 => Ok(Event::NewObj),   // NEWOBJ
+            0x92 => Ok(Event::NewObjEx), // NEWOBJ_EX
 
             // Persistent objects
             0x50 => {
                 // PERSID
-                let s = self.read_line_string(buf)?;
-                Ok(Event::PersId(s))
+                let id_len = self.fill_line(buf)?;
+                Ok(Event::PersId { id_len })
             }
-            0x51 => Ok(Event::BinPersId),   // Q
+            0x51 => Ok(Event::BinPersId), // Q
 
             // Extensions
-            0x82 => Ok(Event::Ext1(self.read_u8()?)),         // EXT1
-            0x83 => Ok(Event::Ext2(self.read_u16()?)),        // EXT2
+            0x82 => Ok(Event::Ext1(self.read_u8()?)), // EXT1
+            0x83 => Ok(Event::Ext2(self.read_u16()?)), // EXT2
             0x84 => Ok(Event::Ext4(self.read_i32()? as u32)), // EXT4
 
             // Protocol 4
@@ -387,13 +398,13 @@ mod tests {
 
     #[test]
     fn size_of_event() {
-        assert_eq!(std::mem::size_of::<Event>(), 56);
+        assert_eq!(std::mem::size_of::<Event>(), 16);
     }
 
     #[test]
     fn test_read_true() -> Result<(), Error> {
         let data: &[u8] = b"\x80\x04\x88.";
-        let mut reader = Reader::new(data)?;
+        let mut reader = Reader::new(data);
         let mut buf = Vec::new();
         loop {
             match reader.read_event(&mut buf)? {
@@ -409,7 +420,7 @@ mod tests {
     #[test]
     fn test_read_int() -> Result<(), Error> {
         let data: &[u8] = b"\x80\x04\x95\x06\x00\x00\x00\x00\x00\x00\x00J\x00\x00\x10\x00.";
-        let mut reader = Reader::new(data)?;
+        let mut reader = Reader::new(data);
         let mut buf = Vec::new();
         loop {
             match reader.read_event(&mut buf)? {
@@ -426,17 +437,19 @@ mod tests {
     #[test]
     fn test_read_float() -> Result<(), Error> {
         let data: &[u8] = b"\x80\x04\x95\n\x00\x00\x00\x00\x00\x00\x00G?\xe1G\xae\x14z\xe1H.";
-        let mut reader = Reader::new(data)?;
+        let mut reader = Reader::new(data);
         let mut buf = Vec::new();
+        let mut value = 0.0;
         loop {
             match reader.read_event(&mut buf)? {
-                Event::BinFloat(v) => assert_eq!(v, 0.54),
+                Event::Float(v) => value = v,
                 Event::Stop => break,
                 _ => (),
             }
             buf.clear();
         }
 
+        assert_eq!(value, 0.54);
         Ok(())
     }
 
@@ -447,7 +460,7 @@ mod tests {
             0x80, 0x04, 0x95, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x8c, 0x01, b'/',
             0x94, b'.',
         ];
-        let mut reader = Reader::new(data)?;
+        let mut reader = Reader::new(data);
         let mut buf = Vec::new();
         let mut s = Vec::new();
         loop {
@@ -468,7 +481,7 @@ mod tests {
     #[test]
     fn test_read_list_ints() -> Result<(), Error> {
         let data: &[u8] = b"\x80\x04\x95\x19\x00\x00\x00\x00\x00\x00\x00]\x94(K\x00K\x01K\x02K\x03K\x04K\x05K\x06K\x07K\x08K\te.";
-        let mut reader = Reader::new(data)?;
+        let mut reader = Reader::new(data);
         let mut buf = Vec::new();
         let mut list = Vec::new();
         loop {

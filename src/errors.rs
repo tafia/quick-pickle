@@ -1,10 +1,11 @@
 // #[derive(Debug)]
 pub enum Error {
     Io(std::io::Error),
-    Protocol([u8; 2]),
+    Protocol(u8),
     /// Unsupported opcode
     OpCode(u8),
     Str(std::str::Utf8Error),
+    Float(std::num::ParseFloatError),
 }
 
 impl From<std::io::Error> for Error {
@@ -20,6 +21,7 @@ impl std::fmt::Debug for Error {
             Error::Protocol(p) => write!(f, "Unsupported protocol: 0x{p:x?}"),
             Error::OpCode(op) => write!(f, "Unsupported opcode: 0x{op:x}"),
             Error::Str(error) => error.fmt(f),
+            Error::Float(error) => error.fmt(f),
         }
     }
 }
